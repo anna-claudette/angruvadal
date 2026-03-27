@@ -119,3 +119,9 @@ Apache 2.0
 ## Status
 
 Early research / implementation in progress. Hardware: GURTHANG II (AMD Ryzen 9 9900X + RX 9070 + 192GB DDR5). Contributions and hardware-diverse benchmarks welcome.
+
+---
+
+## By the Same Author
+
+- **[Precursor](https://github.com/anna-claudette/precursor)** *(if public)* — Kaiju-mech visual novel / RTS hybrid. The Kingdom that built this hardware.
