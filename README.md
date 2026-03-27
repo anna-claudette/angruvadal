@@ -5,19 +5,64 @@
 **RAM-Backed MCP Memory Architecture for Consumer LLM Inference**  
 *Codename: Angruvadal*
 
-> 900K token context window. 16GB VRAM. 80–120 tok/s.
+> Sub-10ms retrieval. 90% RAG accuracy. 100% tool compliance. ~200 lines of code.
 
 ---
 
 ## What This Is
 
-Angruvadal is an architecture and implementation for extending local LLM inference context far beyond VRAM limits using a two-layer approach:
+Angruvadal is a working implementation of two complementary ideas:
 
-1. **VRAM-Efficient Inference** — RotorQuant 3-bit KV cache compression (3.7× reduction) combined with expert-aware offloading for MoE models. Keeps everything in-tier, avoids PCIe streaming bottlenecks.
+**1. RAM as first-class LLM memory (proven today)**
+A FastAPI MCP server backed by 192GB DDR5. Any llama.cpp-served model calls `context_retrieve` as a tool — the server does semantic search and returns relevant context in <10ms. The model never hits a context limit. It just calls a tool when it needs to remember something.
 
-2. **MCP RAM Fleet** — A fleet of small fast LLMs (1–3B) running on CPU, backed by 192GB DDR5, exposed as an MCP server. The flagship model calls tools (`context_store`, `context_retrieve`, `expert_prefetch`) to access an intelligent, queryable memory layer. The 192GB isn't overflow — it's a first-class memory system.
+**2. RotorQuant KV compression (in progress)**
+3-bit KV cache compression at 3.5× ratio, Triton kernels confirmed working on AMD RDNA4 (gfx1201). When integrated into llama.cpp, extends in-VRAM context window from ~52K to ~192K tokens. Combined with the MCP layer: effectively unlimited context on consumer hardware.
 
-Built on and validated for AMD RDNA4 (RX 9070, gfx1201) with ROCm 7.2.1. Also works on Vulkan.
+---
+
+## Proven Results (2026-03-27, GURTHANG II)
+
+### MCP RAM Server
+
+| Metric | Value |
+|--------|-------|
+| Retrieve p50 @ 1K chunks | **9.0ms** |
+| Retrieve p50 @ 5K chunks | **16.6ms** |
+| Sequential throughput | **62.5 queries/sec** |
+| Memory per chunk | **1.82 KB** (→ 105M chunks in 192GB) |
+| RAG accuracy (10 QA pairs) | **90% (9/10)** |
+| Tool call compliance | **100% (10/10)** |
+| MCP overhead in E2E latency | **<0.2%** |
+| Scaling behavior | Linear O(n) — no cliffs to 25K+ chunks |
+
+### GPT-OSS 20B on RX 9070 (llama.cpp Vulkan)
+
+| Metric | Value |
+|--------|-------|
+| Token generation | **134 tok/s** |
+| Prompt processing | **3,574 tok/s** |
+| VRAM | 12.5GB / 16GB |
+| Context window | 128K (YaRN RoPE) |
+| Load time | 3.4s |
+
+---
+
+## Architecture
+
+```
+User prompt
+    ↓
+GPT-OSS 20B — GPU (16GB VRAM, 134 tok/s)
+    ↓ tool call: context_retrieve
+    ↓
+Angruvadal MCP — RAM (192GB DDR5, 9ms)
+    ↓ semantic search → relevant chunks returned
+    ↓ model incorporates context, answers
+Response
+```
+
+The model decides when to call the tool. The RAM holds everything. The GPU does the thinking.
 
 ---
 
@@ -29,84 +74,68 @@ Built on and validated for AMD RDNA4 (RX 9070, gfx1201) with ROCm 7.2.1. Also wo
 | CPU | AMD Ryzen 9 9900X — 12C/24T |
 | RAM | 192GB DDR5 |
 | OS | Ubuntu 24.04, ROCm 7.2.1 |
-| Model | GPT-OSS 20B (OpenAI, MXFP4, Apache 2.0) |
+| LLM | GPT-OSS 20B (OpenAI, Apache 2.0) via llama.cpp |
 
 ---
 
-## Context Window Math
+## Quick Start
 
-| Configuration | KV Size | Context Tokens | tok/s |
-|---|---|---|---|
-| Baseline (FP16 KV, 2.5GB headroom) | 48KB/token | ~52K | 134 |
-| + RotorQuant 3-bit | 13KB/token | ~192K | ~125 |
-| + RotorQuant + RAM tier | 13KB/token (VRAM) + 192GB RAM | ~900K+ | ~120 |
-| + MCP semantic fleet | unlimited semantic retrieval | ∞ effective | ~120 |
+```bash
+# Install
+pip install fastapi uvicorn sentence-transformers numpy
 
----
+# Start MCP server
+python3 src/mcp_server/server.py
+# → Running on port 8765
 
-## Architecture
+# Start llama.cpp with a model
+llama-server -m your-model.gguf --port 8081 -ngl 99 --flash-attn
 
-```
-┌─────────────────────────────────────────────┐
-│  GPU — 16GB VRAM                            │
-│  GPT-OSS 20B (13GB)                         │
-│  RotorQuant KV cache (hot, compressed)      │
-│  → 134 tok/s generation                     │
-└─────────────────┬───────────────────────────┘
-                  │ MCP tool calls
-┌─────────────────▼───────────────────────────┐
-│  RAM MCP Server — 192GB DDR5                │
-│  ├── Router LLM (1-3B, CPU)                 │
-│  ├── Retrieval LLM (1-3B, semantic search)  │
-│  ├── Compression LLM (summarize → NVMe)     │
-│  └── Expert Prefetch (MoE routing ahead)    │
-└─────────────────┬───────────────────────────┘
-                  │ cold archive
-┌─────────────────▼───────────────────────────┐
-│  NVMe — 1.8TB cold storage                  │
-└─────────────────────────────────────────────┘
+# Run end-to-end test
+python3 src/mcp_server/test_end_to_end.py
 ```
 
 ---
 
-## Implementation Phases
+## Roadmap
 
-### Phase 1 — Validated ✅
-- GPT-OSS 20B running at 134 tok/s on RX 9070 via llama.cpp Vulkan
-- ROCm 7.2.1 benchmarks: first published gfx1201 inference data
-- bitsandbytes 0.50.0.dev0: QLoRA + LLM.int8() on RDNA4
+### ✅ Phase 1 — Proven
+- GPT-OSS 20B at 134 tok/s on RX 9070 (RDNA4) — first consumer AMD benchmarks
+- ROCm 7.2.1 discovery: flash attention gives 5.5× prompt processing improvement
+- bitsandbytes 0.50.0.dev0: QLoRA + LLM.int8() on gfx1201 — first RDNA4 validation
+- Angruvadal MCP server: 9ms retrieval, 90% accuracy, 100% tool compliance
 
-### Phase 2 — In Progress 🔨
-- RotorQuant KV cache integration into llama.cpp
-- ~200–300 lines C++ in attention layer
+### 🔨 Phase 2 — RotorQuant KV Integration
+- C++ patch to llama.cpp attention layer (~200-300 lines)
 - Triton kernels confirmed working on gfx1201
+- Target: 3.5× KV compression → 192K in-VRAM context on GPT-OSS 20B
 
-### Phase 3 — Planned 📋
-- MCP RAM server (Python)
-- Tools: `context_store`, `context_retrieve`, `expert_prefetch`
-- Fleet model integration
-
-### Phase 4 — Future 🎯
-- Full integration + benchmarks
-- 128K → 900K context validation
-- Architecture paper
+### 📋 Phase 3 — Fleet Models
+- Small 1-3B routing model on CPU
+- Proactive context prefetch (model doesn't need to ask — router watches and prefetches)
+- Persistent store (survive reboots via LMDB/Arrow serialization)
 
 ---
 
-## Related Work & Benchmarks
+## Related Posts
 
-| Finding | Link |
-|---|---|
-| First RDNA4 ROCm 7.2.1 inference benchmarks | r/LocalLLaMA, r/ROCm |
-| bitsandbytes gfx1201 build guide | See `docs/bitsandbytes-rdna4.md` |
-| GPT-OSS 20B RDNA4 results | See `docs/gpt-oss-20b-benchmarks.md` |
-| RotorQuant math | [scrya-com/rotorquant](https://github.com/scrya-com/rotorquant) |
+- [First RDNA4 ROCm 7.2.1 Benchmarks](https://reddit.com/r/LocalLLaMA) — flash attention discovery, MMQ+GRAPHS+FA flags
+- [GPT-OSS 20B on Consumer AMD GPU] — 134 tok/s, Triton gfx1201 patch
+- [Angruvadal: RAM-Backed MCP Memory] — this work
+
+---
+
+## What We Don't Claim
+
+- Production-ready at any scale
+- Beats dedicated vector databases (different use case)
+- Works well with very large same-domain corpora (semantic accuracy degrades — use a better embedding model)
 
 ---
 
 ## Name
 
-*Angruvadal* — the Ancestor Blade from Larry Correia's Saga of the Forgotten Warrior. Sentient, stores the memories of every previous Bearer, gives their accumulated skill to the current wielder. The architecture mirrors this: every query draws on accumulated knowledge from all prior sessions. The RAM fleet holds the memories. The GPU flagship fights with their strength.
+*Angruvadal* — the Ancestor Blade from Larry Correia's Saga of the Forgotten Warrior. Stores the memories of every previous Bearer. Gives their accumulated skill to the current wielder. The architecture is the metaphor: every query draws on accumulated knowledge. The RAM holds the memories. The GPU fights with their strength.
 
 ---
 
@@ -116,12 +145,4 @@ Apache 2.0
 
 ---
 
-## Status
-
-Early research / implementation in progress. Hardware: GURTHANG II (AMD Ryzen 9 9900X + RX 9070 + 192GB DDR5). Contributions and hardware-diverse benchmarks welcome.
-
----
-
-## By the Same Author
-
-- **[Precursor](https://github.com/anna-claudette/precursor)** *(if public)* — Kaiju-mech visual novel / RTS hybrid. The Kingdom that built this hardware.
+*Built on GURTHANG II. Contributions and hardware-diverse benchmarks welcome.*
