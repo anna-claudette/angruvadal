@@ -1,5 +1,7 @@
 # Angruvadal
 
+![Angruvadal Banner](docs/banner.png)
+
 **RAM-Backed MCP Memory Architecture for Consumer LLM Inference**  
 *Codename: Angruvadal*
 
